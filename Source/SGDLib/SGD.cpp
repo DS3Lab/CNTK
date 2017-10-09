@@ -16,6 +16,7 @@
 #include "MatrixQuantizerImpl.h"
 #include "InputAndParamNodes.h"
 #include "AccumulatorAggregation.h"
+#include "NcclComm.h"
 
 #ifdef CNTK_PARALLEL_TRAINING_SUPPORT
 //static inline bool operator==(const std::pair<double,size_t>& a, double b) { assert(b==0); return a.first == b; }
@@ -35,9 +36,15 @@
 #include "V2SimpleDistGradAggregator.h"
 #include "ProgressTracing.h"
 #include "PerformanceProfiler.h"
+#include <time.h>
+
+#include <iostream>
+#include <typeinfo>
 
 #include <map>
 #include <set>
+
+
 
 namespace Microsoft { namespace MSR { namespace CNTK {
 
@@ -508,6 +515,16 @@ void SGD<ElemType>::TrainOrAdaptModel(int startEpoch, ComputationNetworkPtr net,
     }
 
     // --- MAIN EPOCH LOOP
+    //epochloop
+
+
+    std::vector<std::unique_ptr<Matrix<ElemType>>> weight_replica;
+    weight_replica.reserve((int) m_mpi->NumNodesInUse());
+    std::vector<std::unique_ptr<Matrix<ElemType>>>& WeightReplica = weight_replica;
+
+    
+
+
     for (int i = startEpoch; i < (int) m_maxEpochs; i++) // TODO: why is this an int, and not a size_t?
     {
         // Always skip the first epoch for profiling to avoid startup behavior.
@@ -643,7 +660,10 @@ void SGD<ElemType>::TrainOrAdaptModel(int startEpoch, ComputationNetworkPtr net,
 
         EpochCriterion epochCriterion; // criterion values are returned in this
         std::vector<EpochCriterion> epochEvalErrors(evaluationNodes.size());
-        totalMBsSeen += TrainOneEpoch(net,
+
+
+        totalMBsSeen += TrainOneEpoch(WeightReplica,
+                                      net,
                                       refNet,
                                       refNode,
                                       i,
@@ -659,7 +679,10 @@ void SGD<ElemType>::TrainOrAdaptModel(int startEpoch, ComputationNetworkPtr net,
                                       learnableNodes, smoothedGradients, smoothedCounts,
                                       epochCriterion, epochEvalErrors,
                                       "", SIZE_MAX, totalMBsSeen, tensorBoardWriter);
+
+
         totalTrainingSamplesSeen += epochCriterion.second; // aggregate #training samples, for logging purposes only
+        //printf("-------[%d]totalTrainingSamplesSeen: %d-----------\n", (int) m_mpi->CurrentNodeRank(), (int)totalTrainingSamplesSeen);
 
         timer.Stop();
         double epochTime = timer.ElapsedSeconds();
@@ -972,7 +995,8 @@ void SGD<ElemType>::TrainOrAdaptModel(int startEpoch, ComputationNetworkPtr net,
 // -----------------------------------------------------------------------
 
 template <class ElemType>
-size_t SGD<ElemType>::TrainOneEpoch(ComputationNetworkPtr net,
+size_t SGD<ElemType>::TrainOneEpoch(std::vector<std::unique_ptr<Matrix<ElemType>>>& WeightReplica,
+                                    ComputationNetworkPtr net,
                                     ComputationNetworkPtr refNet,
                                     const ComputationNodeBasePtr& refNode,
                                     const int epochNumber,
@@ -994,6 +1018,7 @@ size_t SGD<ElemType>::TrainOneEpoch(ComputationNetworkPtr net,
                                     const size_t totalMBsSeenBefore,
                                     ::CNTK::Internal::TensorBoardFileWriterPtr tensorBoardWriter)
 {
+
     PROFILE_SCOPE(profilerEvtMainEpoch);
 
     ScopedNetworkOperationMode modeGuard(net, NetworkOperationMode::training);
@@ -1032,11 +1057,9 @@ size_t SGD<ElemType>::TrainOneEpoch(ComputationNetworkPtr net,
     }
 
     std::vector<Matrix<ElemType>*> learnParamsGradients;
-    std::vector<Matrix<ElemType>*> learnParams;
-
-
+    std::vector<Matrix<ElemType>*> learnParamsWeights;
+    std::vector<Matrix<ElemType>*> Weights_cover;
     Profiler profiler(m_numMBsToCUDAProfile);
-
 
     // resetting this, so profiling is performed for one epoch only
     m_numMBsToCUDAProfile = 0;
@@ -1046,11 +1069,15 @@ size_t SGD<ElemType>::TrainOneEpoch(ComputationNetworkPtr net,
                                    trainSetDataReader->SupportsDistributedMBRead();
     if (useDistributedMBReading)
     {
+        //printf("[%d] useDistributedMBReading \n", (int) m_mpi->CurrentNodeRank());
+
         trainSetDataReader->StartDistributedMinibatchLoop(tunedMBSize, epochNumber, m_mpi->CurrentNodeRank(),
             m_mpi->NumNodesInUse(), inputMatrices->GetStreamDescriptions(), epochSize);
     }
     else
     {
+        //printf("[%d] !useDistributedMBReading \n", (int) m_mpi->CurrentNodeRank());
+
         trainSetDataReader->StartMinibatchLoop(tunedMBSize, epochNumber, inputMatrices->GetStreamDescriptions(), epochSize);
     }
 
@@ -1162,6 +1189,98 @@ size_t SGD<ElemType>::TrainOneEpoch(ComputationNetworkPtr net,
 
     bool noMoreSamplesToProcess = false;
     bool isFirstMinibatch = true;
+
+
+
+    //MBloop
+
+
+    srand((unsigned)time(NULL));
+    //std::vector<std::unique_ptr<Matrix<ElemType>>> y;
+    int myrank = (int) m_mpi->CurrentNodeRank();
+    int numproc = (int) m_mpi->NumNodesInUse();
+    
+    float weight[numproc][numproc];
+
+    //full connected
+    // for(int i = 0; i < numproc; i++){
+    //     for(int j = 0; j < numproc; j++){
+    //         weight[i][j] = 1.0/numproc;
+    //     }
+    // }
+
+    //Loop
+    for(int i = 0; i < numproc; i++){
+        for(int j = 0; j < numproc; j++){
+
+            if(i == 0){
+                if (j == i || j == 1 || j == numproc-1)
+                    weight[i][j] = 1.0/3.0;
+                else
+                    weight[i][j] = 0;
+            }
+            else if (i == numproc-1){
+                if (j == i || j == 0 || j == i-1)
+                    weight[i][j] = 1.0/3.0;
+                else
+                    weight[i][j] = 0;
+            }
+            else{
+                if(j == i || j == (i-1) || j == (i+1))
+                    weight[i][j] = 1.0/3.0;
+                else
+                    weight[i][j] = 0;
+            }
+            
+        }
+    }
+
+    // for(int i = 0; i < numproc; i++){
+    //     for(int j = 0; j < numproc; j++){
+
+    //         if(i == 0){
+    //             if (j == i || j == 1 || j == numproc-1 || j == 4)
+    //                 weight[i][j] = 1.0/4.0;
+    //             else
+    //                 weight[i][j] = 0;
+    //         }
+    //         else if (i == numproc-1){
+    //             if (j == i || j == 0 || j == i-1 || j == 3)
+    //                 weight[i][j] = 1.0/4.0;
+    //             else
+    //                 weight[i][j] = 0;
+    //         }
+    //         else if(i <= 3){
+    //             if(j == i || j == (i-1) || j == (i+1) || j == (i+4))
+    //                 weight[i][j] = 1.0/4.0;
+    //             else
+    //                 weight[i][j] = 0;
+    //         }
+    //         else{
+    //             if(j == i || j == (i-1) || j == (i+1) || j == (i-4))
+    //                 weight[i][j] = 1.0/4.0;
+    //             else
+    //                 weight[i][j] = 0;
+    //         }
+            
+    //     }
+    // }
+
+
+    std::unique_ptr<Matrix<ElemType>> weight_current;
+    std::unique_ptr<Matrix<ElemType>> weight_averaged;
+    std::vector<int> indexNeighbor;
+    int numofWeights = 0;
+
+    indexNeighbor.reserve(numproc-1);
+    for(int i = 0; i < numproc; i++){
+        if (weight[myrank][i] > 0 && i != myrank){
+            indexNeighbor.push_back(i);
+        }
+    }
+
+
+
     for (;;)
     {
         auto profMinibatch = ProfilerTimeBegin();
@@ -1207,6 +1326,86 @@ size_t SGD<ElemType>::TrainOneEpoch(ComputationNetworkPtr net,
         ComputationNetwork::BumpEvalTimeStamp(featureNodes);
         ComputationNetwork::BumpEvalTimeStamp(labelNodes);
 
+
+////////////////////////////////compute gradient////////////////////////////////////
+        
+        //initialize learnParamsWeights and Weights_cover
+        if(epochNumber >= 2){
+
+            if (learnParamsWeights.size() == 0)
+            {
+                learnParamsWeights.reserve(learnableNodes.size());
+                Weights_cover.reserve(learnableNodes.size());
+
+                for (auto nodeIter = learnableNodes.begin(); nodeIter != learnableNodes.end(); nodeIter++)
+                {
+                    ComputationNodePtr node = dynamic_pointer_cast<ComputationNode<ElemType>>(*nodeIter);
+                    if (node->IsParameterUpdateRequired())
+                    {
+                        //Matrix<ElemType>* currParamsGradient = &(node->Gradient()); // TODO: we can use shared_ptrs now
+                        Matrix<ElemType>* currParamsWeight = &(node->Value()); 
+                        Matrix<ElemType>* currWeight_cover = new (std::nothrow) Matrix<ElemType>(currParamsWeight->GetNumRows(), currParamsWeight->GetNumCols(), currParamsWeight->GetDeviceId());
+                        //currWeight_cover->AssignValuesOf(currParamsWeight);
+            
+                        learnParamsWeights.push_back(currParamsWeight);
+                        Weights_cover.push_back(currWeight_cover);
+                    }
+                }
+
+                for(int i = 0; i < learnParamsWeights.size(); i++)
+                    numofWeights += learnParamsWeights[i]->GetNumElements();
+            }
+
+            //initialize WeightReplica in first eopch in first iteration
+            if(WeightReplica.size() == 0){
+
+                for(int i = 0; i < indexNeighbor.size(); i++){
+
+                    std::unique_ptr<Matrix<ElemType>> buffer_y;
+                    buffer_y.reset();
+                    buffer_y.reset(new (std::nothrow) Matrix<ElemType>(1, numofWeights, learnParamsWeights[0]->GetDeviceId()));
+
+                    
+                    size_t offset_y = 0;
+                    for (int i = 0; i < learnParamsWeights.size(); i++)
+                    {
+                        buffer_y->ColumnSlice(offset_y, learnParamsWeights[i]->GetNumElements()).AssignValuesOf(learnParamsWeights[i]->Reshaped(1, learnParamsWeights[i]->GetNumElements()));
+                        offset_y += learnParamsWeights[i]->GetNumElements();
+                    }
+                    WeightReplica.push_back(std::move(buffer_y));
+                }
+                //accu_weight->ColumnSlice(0, numofWeights).AssignValuesOf(y[0]);
+
+            }
+
+            //get current weight
+            weight_current.reset();
+            weight_current.reset(new (std::nothrow) Matrix<ElemType>(1, numofWeights, learnParamsWeights[0]->GetDeviceId()));
+            size_t offset1 = 0;
+            for (int i = 0; i < learnParamsWeights.size(); i++)
+            {
+                weight_current->ColumnSlice(offset1, learnParamsWeights[i]->GetNumElements()).AssignValuesOf(learnParamsWeights[i]->Reshaped(1, learnParamsWeights[i]->GetNumElements()));
+                offset1 += learnParamsWeights[i]->GetNumElements();
+            }
+
+            //averaging weights
+            weight_averaged.reset();
+            weight_averaged.reset(new (std::nothrow) Matrix<ElemType>(1, numofWeights, learnParamsWeights[0]->GetDeviceId()));
+
+            for(int i = 0; i <= indexNeighbor.size(); i++){
+
+                if(i < indexNeighbor.size()){
+                    Matrix<ElemType>::ScaleAndAdd(weight[myrank][indexNeighbor[i]], *WeightReplica[i], *weight_averaged);
+                }else if(i == indexNeighbor.size()){
+                    Matrix<ElemType>::ScaleAndAdd(weight[myrank][myrank], *weight_current, *weight_averaged);
+                }
+            
+            }
+
+        }
+
+
+
         if (actualMBSize > 0)
         {
             assert(wasDataRead);
@@ -1214,6 +1413,24 @@ size_t SGD<ElemType>::TrainOneEpoch(ComputationNetworkPtr net,
             if (m_doGradientCheck && GradientCheck(net, criterionNodes, learnableNodes, 0) == false)
                 LogicError("cannot pass gradient checker");
 #endif
+            
+            //use accurate weight to compute gradient
+            // if(epochNumber >= 2 && numMBsRun > 0){
+            //     for (int i = 0; i < learnParamsWeights.size(); i++)
+            //         learnParamsWeights[i]->AssignValuesOf(*Weights_cover[i]);
+            // }
+            
+            if(epochNumber >= 2){
+
+                size_t offset5 = 0;
+                for (int i = 0; i < learnParamsWeights.size(); i++)
+                {
+                    learnParamsWeights[i]->AssignValuesOf(weight_averaged->ColumnSlice(offset5, learnParamsWeights[i]->GetNumElements()).Reshaped(learnParamsWeights[i]->GetNumRows(), learnParamsWeights[i]->GetNumCols()));
+                    offset5 += learnParamsWeights[i]->GetNumElements();
+                }
+            }
+
+
             // TODO: currently we only support one node for regularization
             if (m_needAdaptRegularization && m_adaptationRegType == AdaptationRegType::KL && refNode)
             {
@@ -1268,6 +1485,9 @@ size_t SGD<ElemType>::TrainOneEpoch(ComputationNetworkPtr net,
         } // if (actualMBSize > 0)
         // WARNING: If actualMBSize == 0, then criterion nodes have NOT been updated, and contain garbage (last MB's) values.
 
+
+
+
         // In case of mini epochs (used for adaptive minibatch size and learning rate),
         // no more data should be processed by this worker.
         if (shouldCheckEarlyExit)
@@ -1291,6 +1511,17 @@ size_t SGD<ElemType>::TrainOneEpoch(ComputationNetworkPtr net,
         size_t aggregateNumSamples = actualMBSize; // (0 for empty MB)
         size_t aggregateNumSamplesWithLabel = CriterionAccumulator<ElemType>::GetNumSamples(criterionNodes[0], numSamplesWithLabelOfNetwork); // (0 for empty MB)
 
+        //printf("[%d] actualMBSize:%d\n", myrank, (int)actualMBSize);
+
+
+
+
+///////////////////////////////////////////UPDATEMODEL//////////////////////////////////////
+
+
+
+
+
         if (!useGradientAggregation)
         {
             // accumulate criterion values (objective, eval)
@@ -1300,204 +1531,250 @@ size_t SGD<ElemType>::TrainOneEpoch(ComputationNetworkPtr net,
             for (size_t i = 0; i < evaluationNodes.size(); i++)
                 localEpochEvalErrors.Add(i, numSamplesWithLabelOfNetwork);
         }
-       // else
-        //{
-            //shape the learnParams of a worker
+         else
+         {
+
+            if(epochNumber < 2){ //epochNumber < 2
+
+                // distributed gradient aggregation
+                if (learnParamsGradients.size() == 0)
+                {
+                    // lazily form the list of smoothedGradients to exchange
+                    learnParamsGradients.reserve(learnableNodes.size());
+                    //learnParamsWeights.reserve(learnableNodes.size());
+                    for (auto nodeIter = learnableNodes.begin(); nodeIter != learnableNodes.end(); nodeIter++)
+                    {
+                        ComputationNodePtr node = dynamic_pointer_cast<ComputationNode<ElemType>>(*nodeIter);
+                        if (node->IsParameterUpdateRequired())
+                        {
+                            Matrix<ElemType>* currParamsGradient = &(node->Gradient()); // TODO: we can use shared_ptrs now
+                            //Matrix<ElemType>* currParamsWeight = &(node->Value());
+                            // Sometimes, in parallel training, the current node may not get any samples to process
+                            // In this case, the gradient matrix may not have been sized yet. If so, lets size it.
+                            if (currParamsGradient->GetNumCols() == 0)
+                            {
+                                Matrix<ElemType>* currParamsValues = &(node->Value());
+                                currParamsGradient->Resize(currParamsValues->GetNumRows(), currParamsValues->GetNumCols());
+                            }
+
+                            learnParamsGradients.push_back(currParamsGradient);
+                            //learnParamsWeights.push_back(currParamsWeight);
+                        }
+                    }
+                }
+                //printf("[%d]real weights: %f\n", myrank, learnParamsWeights[0]->GetValue(0,7));
 
 
-            // distributed gradient aggregation
-            // if (learnParamsGradients.size() == 0)
-            // {
-            //     // lazily form the list of smoothedGradients to exchange
-            //     learnParamsGradients.reserve(learnableNodes.size());
+                // hoist the criterion into CPU space for all-reduce
+                localEpochCriterion.Assign(0, numSamplesWithLabelOfNetwork);
+                for (size_t i = 0; i < evaluationNodes.size(); i++)
+                    localEpochEvalErrors.Assign(i, numSamplesWithLabelOfNetwork);
 
-            //     for (auto nodeIter = learnableNodes.begin(); nodeIter != learnableNodes.end(); nodeIter++)
-            //     {
-            //         ComputationNodePtr node = dynamic_pointer_cast<ComputationNode<ElemType>>(*nodeIter);
-            //         if (node->IsParameterUpdateRequired())
-            //         {
-            //             Matrix<ElemType>* currParamsGradient = &(node->Gradient()); // TODO: we can use shared_ptrs now
+                // copy all values to be aggregated into the header
+                m_gradHeader->numSamples = aggregateNumSamples;
+                m_gradHeader->criterion           = localEpochCriterion.GetCriterion(0).first;
+                m_gradHeader->numSamplesWithLabel = localEpochCriterion.GetCriterion(0).second; // same as aggregateNumSamplesWithLabel
+                assert(m_gradHeader->numSamplesWithLabel == aggregateNumSamplesWithLabel);
+                for (size_t i = 0; i < evaluationNodes.size(); i++)
+                    m_gradHeader->evalErrors[i] = localEpochEvalErrors.GetCriterion(i);
 
-            //             // Sometimes, in parallel training, the current node may not get any samples to process
-            //             // In this case, the gradient matrix may not have been sized yet. If so, lets size it.
-            //             if (currParamsGradient->GetNumCols() == 0)
-            //             {
-            //                 Matrix<ElemType>* currParamsValues = &(node->Value());
-            //                 currParamsGradient->Resize(currParamsValues->GetNumRows(), currParamsValues->GetNumCols());
-            //             }
+                // aggregate
+                m_gradHeader->numEvalNode = evaluationNodes.size(); // TODO: rename numEvalNode (plural)
+                bool samplesProcessed = m_distGradAgg->AggregateGradients(learnParamsGradients, m_gradHeader.get(), isFirstMinibatch);
+                noMoreSamplesToProcess = !samplesProcessed;
 
-            //             learnParamsGradients.push_back(currParamsGradient);
-            //         }
-            //     }
-            // }
+                // read out the header--now everything is aggregated
+                aggregateNumSamples          = m_gradHeader->numSamples;
+                aggregateNumSamplesWithLabel = m_gradHeader->numSamplesWithLabel;
+                epochCriterion += EpochCriterion(m_gradHeader->criterion, m_gradHeader->numSamplesWithLabel);
+                for (size_t i = 0; i < epochEvalErrors.size(); i++)
+                {
+                    if (ContainsAccumulatedResult(evaluationNodes[i]))
+                    {
+                        // We don't accumulate error in epoch criterion as this node has already accumulated error for
+                        // all samples that passed through network in forward pass.
+                        if (samplesProcessed)
+                        {
+                            epochEvalErrors[i] = m_gradHeader->evalErrors[i];
+                        }
+                        // else: no samples processed, no aggregation happened -> we do not want to override current value
+                        // with 0.
+                    }
+                    else
+                        epochEvalErrors[i] += m_gradHeader->evalErrors[i];
+                }
+        }else{
+
+
 
             // hoist the criterion into CPU space for all-reduce
-            // localEpochCriterion.Assign(0, numSamplesWithLabelOfNetwork);
-            // for (size_t i = 0; i < evaluationNodes.size(); i++)
-            //     localEpochEvalErrors.Assign(i, numSamplesWithLabelOfNetwork);
+            localEpochCriterion.Assign(0, numSamplesWithLabelOfNetwork);
+            for (size_t i = 0; i < evaluationNodes.size(); i++)
+                localEpochEvalErrors.Assign(i, numSamplesWithLabelOfNetwork);
 
-            // // copy all values to be aggregated into the header
-            // m_gradHeader->numSamples = aggregateNumSamples;
-            // m_gradHeader->criterion           = localEpochCriterion.GetCriterion(0).first;
-            // m_gradHeader->numSamplesWithLabel = localEpochCriterion.GetCriterion(0).second; // same as aggregateNumSamplesWithLabel
-            // assert(m_gradHeader->numSamplesWithLabel == aggregateNumSamplesWithLabel);
-            // for (size_t i = 0; i < evaluationNodes.size(); i++)
-            //     m_gradHeader->evalErrors[i] = localEpochEvalErrors.GetCriterion(i);
+            // copy all values to be aggregated into the header
+            m_gradHeader->numSamples = aggregateNumSamples;
+            m_gradHeader->criterion           = localEpochCriterion.GetCriterion(0).first;
+            m_gradHeader->numSamplesWithLabel = localEpochCriterion.GetCriterion(0).second; // same as aggregateNumSamplesWithLabel
+            assert(m_gradHeader->numSamplesWithLabel == aggregateNumSamplesWithLabel);
+            for (size_t i = 0; i < evaluationNodes.size(); i++)
+                m_gradHeader->evalErrors[i] = localEpochEvalErrors.GetCriterion(i);
+            m_gradHeader->numEvalNode = evaluationNodes.size(); 
 
-            // // aggregate
-            // m_gradHeader->numEvalNode = evaluationNodes.size(); // TODO: rename numEvalNode (plural)
-            // bool samplesProcessed = m_distGradAgg->AggregateGradients(learnParamsGradients, m_gradHeader.get(), isFirstMinibatch);
-            // noMoreSamplesToProcess = !samplesProcessed;
-
-            // // read out the header--now everything is aggregated
-            // aggregateNumSamples          = m_gradHeader->numSamples;
-            // aggregateNumSamplesWithLabel = m_gradHeader->numSamplesWithLabel;
-            // epochCriterion += EpochCriterion(m_gradHeader->criterion, m_gradHeader->numSamplesWithLabel);
-            // for (size_t i = 0; i < epochEvalErrors.size(); i++)
+            //initiate header vector in main node
+            std::vector<DistGradHeader*> m_recvHeaders;
+            if (m_mpi->IsMainNode())
+            {
+                for (size_t i = 0; i < numproc - 1; ++i)
+                    m_recvHeaders.push_back(DistGradHeader::Create(m_gradHeader->numEvalNode));
+            }
+            // int deviceId = gradients[0]->GetDeviceId();
+            // if (showSyncPerfStats)
             // {
-            //     if (ContainsAccumulatedResult(evaluationNodes[i]))
-            //     {
-            //         // We don't accumulate error in epoch criterion as this node has already accumulated error for
-            //         // all samples that passed through network in forward pass.
-            //         if (samplesProcessed)
-            //         {
-            //             epochEvalErrors[i] = m_gradHeader->evalErrors[i];
-            //         }
-            //         // else: no samples processed, no aggregation happened -> we do not want to override current value
-            //         // with 0.
-            //     }
-            //     else
-            //         epochEvalErrors[i] += m_gradHeader->evalErrors[i];
+            //     std::unique_ptr<MatrixComputeStreamEvent> mainStreamSyncEvent(MatrixComputeStreamEvent::Create(deviceId));
+            //     mainStreamSyncEvent->SynchronizeEvent();
+            //     aggregationTimer.Start();
             // }
-        //}
+
+             // Initiate receive of the header on the main node
+            std::vector<MPI_Request> recvHeaderRequests(numproc - 1);
+            if (m_mpi->IsMainNode())
+            {
+                for (size_t j = 0; j < numproc - 1; ++j)
+                {
+                    int source = (j >= myrank) ? (j + 1) : j;
+                // We use a tag of 'numGradMatrices' for the pre-aggregation header
+                    m_mpi->Irecv(m_recvHeaders[j], m_recvHeaders[j]->Size(), MPI_CHAR, source, 0, &(recvHeaderRequests[j])) || MpiFail("MPI_Irecv");
+                }
+            }
+
+            //size_t numValueMatrices = gradients.size();
+            // Send the headers from all nodes but the main node
+            MPI_Request sendHeaderRequest;
+            if (!m_mpi->IsMainNode())
+                m_mpi->Isend(m_gradHeader.get(), m_gradHeader.get()->Size(), MPI_CHAR, m_mpi->MainNodeRank(), 0, &sendHeaderRequest) || MpiFail("MPI_Isend");
+
+
+            if (m_mpi->IsMainNode())
+            {
+                size_t numNodesHeadersReceivedFrom = 0;
+                while (numNodesHeadersReceivedFrom < (numproc - 1))
+                {
+                    int idx = MPI_UNDEFINED;
+                    m_mpi->Waitany(recvHeaderRequests.size(), recvHeaderRequests.data(), &idx, MPI_STATUS_IGNORE) || MpiFail("MPI_Waitany");
+                    if (idx == MPI_UNDEFINED)
+                    {
+                        break;
+                    }
+                    numNodesHeadersReceivedFrom++;
+                    m_gradHeader.get()->Aggregate(m_recvHeaders[idx], true);
+                }
+
+                assert(numNodesHeadersReceivedFrom == (numproc - 1));
+            }
+
+            // Broadcast the aggregated header to all nodes
+            m_mpi->Bcast(m_gradHeader.get(), m_gradHeader.get()->Size(), MPI_CHAR, m_mpi->MainNodeRank());
+
+            if (!m_mpi->IsMainNode())
+            m_mpi->Wait(&sendHeaderRequest, MPI_STATUSES_IGNORE) || MpiFail("MPI_Wait");
+
+            bool samplesProcessed = (m_gradHeader.get()->numSamples != 0);
+
+            noMoreSamplesToProcess = !samplesProcessed;
+            // read out the header--now everything is aggregated
+            aggregateNumSamples          = m_gradHeader->numSamples;
+            aggregateNumSamplesWithLabel = m_gradHeader->numSamplesWithLabel;
+            epochCriterion += EpochCriterion(m_gradHeader->criterion, m_gradHeader->numSamplesWithLabel);
+
+            for (size_t i = 0; i < epochEvalErrors.size(); i++)
+            {
+                if (ContainsAccumulatedResult(evaluationNodes[i]))
+                {
+                    // We don't accumulate error in epoch criterion as this node has already accumulated error for
+                    // all samples that passed through network in forward pass.
+                    if (samplesProcessed)
+                    {
+                        epochEvalErrors[i] = m_gradHeader->evalErrors[i];
+                    }
+                    // else: no samples processed, no aggregation happened -> we do not want to override current value
+                    // with 0.
+                }
+                else
+                    epochEvalErrors[i] += m_gradHeader->evalErrors[i];
+            }
+        }
+
+             // headerend = time(NULL);
+             // printf("[%d]header exchange time:%d\n", myrank, headerbegin - headerend);
+        }
 
         ProfilerTimeEnd(profGradientAgg, profilerEvtMainGradient);
         auto profWeights = ProfilerTimeBegin();
 
+
         // update model parameters
         if ((aggregateNumSamples > 0) && (learnRatePerSample > m_minLearnRate * 0.01))
-        { 
-
-             if (learnParams.size() == 0){
-
-                learnParams.reserve(learnableNodes.size());
-                for (auto nodeIter = learnableNodes.begin(); nodeIter != learnableNodes.end(); nodeIter++)
-                {
-                    ComputationNodePtr node = dynamic_pointer_cast<ComputationNode<ElemType>>(*nodeIter);
-                    if (node->IsParameterUpdateRequired()){             
-                        Matrix<ElemType>* currParamsValues = &(node->Value());
-                        learnParams.push_back(currParamsValues);
-                    }
-                }
-            }
-
-            printf("size of learnParams:%d\n",(int)learnParams.size());
-
-            std::vector<MPI_Request> RecvRequests;
-            std::vector<MPI_Request> SendRequests;
-            std::vector<vector<Matrix<ElemType>*>> m_recvParams;
-            std::vector<int> mycontactednode;
-
-            float weight[2][2] = {0.25,0.25,0.25,0.25};
-            //memset(weight,0.25,sizeof(weight));
-
-            int myrank = (int) m_mpi->CurrentNodeRank();
-            int numproc = (int) m_mpi->NumNodesInUse();
-            m_recvParams.reserve(numproc-1);
-            //mycontactednode.reserve(numproc-1);
-
-            //printf("[%d], numproc: %d\n",myrank, numproc);
+        {
 
 
-            //send params to other workers and receive params from other workers
-            for (int i=0; i < numproc; i++) 
+            if(epochNumber < 2){//epochNumber
+
+                #if 1       // BUGBUG: We must skip gaps in our momentum, clipping, regularization etc. criteria.
+                            // This will break test cases. So for now, we will only enable this for per-sample criteria.
+                            size_t numSamplesInMinibatch = aggregateNumSamples;
+                            if (criterionNodes[0]->HasMBLayout())
+                #endif
+                            numSamplesInMinibatch = aggregateNumSamplesWithLabel;
+                #if 0
+                            if (numSamplesInMinibatch != aggregateNumSamples)
+                                fprintf(stderr, "SGD: using true #samples %d instead of MB size %d\n", (int)numSamplesInMinibatch, (int)aggregateNumSamples);
+                #endif
+                            auto smoothedGradientIter = smoothedGradients.begin();
+                            auto smoothedCountIter = smoothedCounts.begin();
+                            for (auto nodeIter = learnableNodes.begin(); nodeIter != learnableNodes.end(); nodeIter++, smoothedGradientIter++, smoothedCountIter++)
+                            {
+                                ComputationNodeBasePtr node = *nodeIter;
+                                if (node->IsParameterUpdateRequired())
+                                {
+                #ifdef _DEBUG
+                                    if (smoothedGradientIter->HasNan("TrainOneEpoch/UpdateWeights(): "))
+                                        LogicError("%ls %ls operation has NaNs in smoothedGradient.", node->NodeName().c_str(), node->OperationName().c_str());
+                #endif
+                                    double nodeDependentLearningRatePerSample = learnRatePerSample * node->GetLearningRateMultiplier();
+                                    double nodeDependentRegMultiplier = dynamic_pointer_cast<LearnableParameter<ElemType>>(node)->GetRegMultiplier();
+                                    double momentumPerSample = GetMomentumPerSample(epochNumber /*BUGBUG workaround:*/, net->GetMBLayoutPtrOfNetwork()->GetNumParallelSequences());
+                                    // TODO: Check why l2Factor is not applied to L1. Bug?
+                                    // BUGBUG (Issue #95): Access to net MBLayout can no longer be done if we have multiple input layouts
+                                    UpdateWeights(dynamic_pointer_cast<ComputationNode<ElemType>>(node)->Value(),
+                                                  dynamic_pointer_cast<ComputationNode<ElemType>>(node)->Gradient(),
+                                                  *smoothedGradientIter, *smoothedCountIter,
+                                                  nodeDependentLearningRatePerSample, momentumPerSample,
+                                                  numSamplesInMinibatch,
+                                                  m_L2RegWeight * nodeDependentRegMultiplier, m_L1RegWeight * nodeDependentRegMultiplier,
+                                                  m_needAveMultiplier, m_useNesterovMomentum);
+                                    node->BumpEvalTimeStamp();
+                #ifdef _DEBUG
+                                    if (dynamic_pointer_cast<ComputationNode<ElemType>>(node)->Value().HasNan("TrainOneEpoch/UpdateWeights(): "))
+                                        LogicError("%ls %ls operation has NaNs in functionValues after parameter update.", node->NodeName().c_str(), node->OperationName().c_str());
+                #endif
+                                }
+                            }
+
+            }else{
+
+            size_t offset2 = 0;
+            for (int i = 0; i < Weights_cover.size(); i++)
             {
-
-                if (i != myrank && weight[myrank][i] > 0){
-
-                    printf("[%d], number of worker:%d\n",myrank, i);
-                    //add a connected worker
-                    mycontactednode.push_back(i);
-                    std::vector<Matrix<ElemType>*> currentworker;
-                    currentworker.reserve(learnParams.size());
-                    m_recvParams.push_back(currentworker);
-
-
-                    //initiate recv for this worker
-                    for(int m_node_idx = 0; m_node_idx < learnParams.size(); m_node_idx++){
-
-                        
-                        Matrix<ElemType>* currentnode; 
-                        currentnode->Zeros(learnParams[m_node_idx]->GetNumRows(), learnParams[m_node_idx]->GetNumCols(), learnParams[m_node_idx]->GetDeviceId());
-                        currentnode->SetValue(0);
-                        m_recvParams.back().push_back(currentnode);
-                       
-
-                        //add recv request
-                        RecvRequests.push_back(MPI_Request()); 
-                       
-                        //printf("[%d,%d]mpi_s%d",myrank, i, m_node_idx);
-                        m_mpi->Irecv(m_recvParams.back()[m_node_idx]->Data(),learnParams[m_node_idx]->GetNumElements(), MPI_FLOAT, i, numproc, &RecvRequests.back());
-                        //m_mpi->WaitAll();
-                        
-                        //printf("[%d,%d]mpi_e%d",myrank, i, m_node_idx);
-                    } 
-                }
+                //seven
+                //printf("[%d] packedGradientsIndex = %d\n", (int)MyRank(), (int)i);
+                Weights_cover[i]->AssignValuesOf(weight_averaged->ColumnSlice(offset2, Weights_cover[i]->GetNumElements()).Reshaped(Weights_cover[i]->GetNumRows(), Weights_cover[i]->GetNumCols()));
+                offset2 += Weights_cover[i]->GetNumElements();
             }
-            // for(int i = 0; i < mycontactednode.size(); i++){
-            //     printf("[%d]mynode[%d]:%d\n",myrank,i, mycontactednode[i]);
-            // }
+
             
 
-
-
-            for(int w = 0; w < (int)mycontactednode.size(); w++){
-
-                // printf("size:%d\n", (int)mycontactednode.size());
-                int des = mycontactednode[w];
-                  
-                //printf("[%d]w=%d;mynode=%d\n",myrank, w, mycontactednode[w]);
-                for(int n = 0; n < learnParams.size(); n++){
-                    
-                    SendRequests.push_back(MPI_Request()); 
-
-                     printf("[%d.%d]received:%f\n",myrank, des, m_recvParams[des][n]->GetValue(1,1));     
-                    //printf("[%d]w=%d;mynode=%d,des=%d\n",myrank, w, mycontactednode[w],des);
-                    m_mpi->Isend(learnParams[n]->Data(), learnParams[n]->GetNumElements(), MPI_FLOAT, des, numproc, &SendRequests.back());
-                    //printf("[%d.%d]send:%f\n",myrank, des, learnParams[n]->GetValue(1,1));             
-                } 
-                //printf("[%d]w=%d;mynode=%d\n",myrank, w, mycontactednode[w]);
-
-            }
-
-
-            //initiate an empty worker
-            std::vector<Matrix<ElemType>*> weightedParams;
-            //weightedParams.reserve(learnableNodes.size());
-
-            for(int i = 0; i < learnParams.size(); i++){
-                
-                Matrix<ElemType>* emptymatrix;
-                emptymatrix->Zeros(learnParams[i]->GetNumRows(),learnParams[i]->GetNumCols(),learnParams[i]->GetDeviceId());
-                weightedParams.push_back(emptymatrix);
-            }
-
-
-
-            //scale and add all params from others
-            for(int worker_idx = 0; worker_idx < m_recvParams.size(); worker_idx++){
-                for (int node_idx = 0; node_idx < learnParams.size(); node_idx++){
-                    Matrix<ElemType>::ScaleAndAdd((ElemType)weight[myrank][mycontactednode[worker_idx]], *m_recvParams[worker_idx][node_idx], *weightedParams[node_idx]);
-                }
-            }
-
-
-            //scale and add params of own
-            for (int node_idx = 0; node_idx < learnParams.size(); node_idx++){
-                Matrix<ElemType>::ScaleAndAdd((ElemType)weight[myrank][myrank], *learnParams[node_idx], *weightedParams[node_idx]);
-            }
-
-
+            
 #if 1       // BUGBUG: We must skip gaps in our momentum, clipping, regularization etc. criteria.
             // This will break test cases. So for now, we will only enable this for per-sample criteria.
             size_t numSamplesInMinibatch = aggregateNumSamples;
@@ -1509,28 +1786,41 @@ size_t SGD<ElemType>::TrainOneEpoch(ComputationNetworkPtr net,
                 fprintf(stderr, "SGD: using true #samples %d instead of MB size %d\n", (int)numSamplesInMinibatch, (int)aggregateNumSamples);
 #endif
             auto smoothedGradientIter = smoothedGradients.begin();
-            auto smoothedCountIter = smoothedCounts.begin();
-            int update_node_idx = 0;
-
-
-            //update params
-            for (auto nodeIter = learnableNodes.begin(); nodeIter != learnableNodes.end(); nodeIter++, smoothedGradientIter++, smoothedCountIter++)
+            auto smoothedCountIter = smoothedCounts.begin();  
+            int i = 0;
+            for (auto nodeIter = learnableNodes.begin(); nodeIter != learnableNodes.end(); nodeIter++, smoothedGradientIter++, smoothedCountIter++, i++)
             {
                 ComputationNodeBasePtr node = *nodeIter;
                 if (node->IsParameterUpdateRequired())
-                {           
-                    dynamic_pointer_cast<ComputationNode<ElemType>>(node)->Value().SetValue(*weightedParams[update_node_idx]);
-                    update_node_idx++;  
+                {
 #ifdef _DEBUG
                     if (smoothedGradientIter->HasNan("TrainOneEpoch/UpdateWeights(): "))
                         LogicError("%ls %ls operation has NaNs in smoothedGradient.", node->NodeName().c_str(), node->OperationName().c_str());
 #endif
-                    double nodeDependentLearningRatePerSample = learnRatePerSample * node->GetLearningRateMultiplier();
+                    //double nodeDependentLearningRatePerSample = learnRatePerSample * node->GetLearningRateMultiplier();
+                    double nodeDependentLearningRatePerSample;
+                    if(epochNumber < 80)
+                        nodeDependentLearningRatePerSample = sqrt(8.0/(totalMBsSeenBefore + numMBsRun + 1 - epochNumber)) * 0.05;
+                    else if(80 <= epochNumber < 120)
+                        nodeDependentLearningRatePerSample = sqrt(8.0/(totalMBsSeenBefore + numMBsRun + 1 - epochNumber)) * 0.01;
+                    else
+                        nodeDependentLearningRatePerSample = sqrt(8.0/(totalMBsSeenBefore + numMBsRun + 1 - epochNumber)) * 0.005;
+
+
+
                     double nodeDependentRegMultiplier = dynamic_pointer_cast<LearnableParameter<ElemType>>(node)->GetRegMultiplier();
                     double momentumPerSample = GetMomentumPerSample(epochNumber /*BUGBUG workaround:*/, net->GetMBLayoutPtrOfNetwork()->GetNumParallelSequences());
                     // TODO: Check why l2Factor is not applied to L1. Bug?
                     // BUGBUG (Issue #95): Access to net MBLayout can no longer be done if we have multiple input layouts
-                    UpdateWeights(dynamic_pointer_cast<ComputationNode<ElemType>>(node)->Value(),
+                    // ElemType weight = dynamic_pointer_cast<ComputationNode<ElemType>>(node)->Value().GetValue(0,0);
+                    // ElemType gradient = dynamic_pointer_cast<ComputationNode<ElemType>>(node)->Value().GetValue(0,0);
+                    // if(myrank == 0)
+                    //     printf("[%d] epochnumber: %d, lr: %f, weight: %f, gradient: %f\n", 
+                    //         myrank, (int)epochNumber ,nodeDependentLearningRatePerSample, weight, gradient);
+
+
+
+                    UpdateWeights(*Weights_cover[i],
                                   dynamic_pointer_cast<ComputationNode<ElemType>>(node)->Gradient(),
                                   *smoothedGradientIter, *smoothedCountIter,
                                   nodeDependentLearningRatePerSample, momentumPerSample,
@@ -1541,9 +1831,160 @@ size_t SGD<ElemType>::TrainOneEpoch(ComputationNetworkPtr net,
 #ifdef _DEBUG
                     if (dynamic_pointer_cast<ComputationNode<ElemType>>(node)->Value().HasNan("TrainOneEpoch/UpdateWeights(): "))
                         LogicError("%ls %ls operation has NaNs in functionValues after parameter update.", node->NodeName().c_str(), node->OperationName().c_str());
-#endif
+#endif               
+                   
                 }
             }
+          
+
+
+            size_t offset3 = 0;
+            for (int i = 0; i < Weights_cover.size(); i++)
+            {
+                weight_averaged->ColumnSlice(offset3, Weights_cover[i]->GetNumElements()).AssignValuesOf(Weights_cover[i]->Reshaped(1, Weights_cover[i]->GetNumElements()));
+                offset3 += Weights_cover[i]->GetNumElements();
+            }
+
+
+            //get the difference 
+            Matrix<ElemType>::ScaleAndAdd(-1, *weight_current, *weight_averaged);
+
+
+
+
+            //compress the difference
+            ElemType max = weight_averaged->GetValue(0, 0), min = weight_averaged->GetValue(0, 0);
+            //int index_max = 0, index_min = 0;
+            for(int j = 0; j < numofWeights; j++){
+
+                if (weight_averaged->GetValue(0, j) > max){
+                    max = weight_averaged->GetValue(0, j);
+                    //index_max = j;
+                }
+                if(weight_averaged->GetValue(0, j) < min){
+                    min = weight_averaged->GetValue(0, j);
+                    //index_min = j;
+                }
+            }
+
+           
+            ElemType unit = (max - min) / 255.0;
+            unsigned char* send_buffer = new unsigned char[numofWeights];
+
+            for(int j = 0; j < numofWeights; j++){
+
+                ElemType d = (weight_averaged->GetValue(0, j) - min) / ((max - min) / 255.0);
+                ElemType prob = d - int(d);
+
+                unsigned char c;
+                
+                if (rand()%1000001 / 1000000.0 < prob)
+                    c = (unsigned char)(int(d) + 1);
+                else
+                    c = (unsigned char)(int(d));
+
+                    
+                send_buffer[j] = c;
+
+                // decompress
+                ElemType uncompress;
+                uncompress = min + send_buffer[j] * unit;
+                weight_averaged->GetValue(0, j);
+                weight_averaged->SetValue(0, j, uncompress);
+
+            }
+
+
+            Matrix<ElemType>::ScaleAndAdd(1, *weight_averaged, *weight_current);
+
+
+            //update the model
+            size_t offset4 = 0;
+            for (int i = 0; i < learnParamsWeights.size(); i++)
+            {
+                learnParamsWeights[i]->AssignValuesOf(weight_current->ColumnSlice(offset4, learnParamsWeights[i]->GetNumElements()).Reshaped(learnParamsWeights[i]->GetNumRows(), learnParamsWeights[i]->GetNumCols()));
+                offset4 += learnParamsWeights[i]->GetNumElements();
+            }
+
+
+            ElemType* send_buffer2 = new ElemType[2];
+            send_buffer2[0] = max;
+            send_buffer2[1] = min;
+
+            //recv_buffer
+            unsigned char **recv_buffer = new unsigned char*[indexNeighbor.size()];
+            for (int i = 0; i < indexNeighbor.size(); ++i)
+            {
+                recv_buffer[i] = new unsigned char[numofWeights];
+            }
+
+            ElemType **recv_buffer2 = new ElemType*[indexNeighbor.size()];
+            for (int i = 0; i < indexNeighbor.size(); ++i)
+            {
+                recv_buffer2[i] = new ElemType[2];
+            }
+
+
+
+            
+
+            std::vector<MPI_Request> request;
+            //MPI send and recv
+            for(int neighbor=0; neighbor < indexNeighbor.size(); neighbor++){
+
+            request.push_back(MPI_Request());
+            m_mpi->Isend(send_buffer, numofWeights, MPI_UNSIGNED_CHAR, indexNeighbor[neighbor], 0, &request.back());
+
+            request.push_back(MPI_Request());
+            m_mpi->Isend(send_buffer2, 2, MPIWrapper::GetDataType(weight_current->Data()), indexNeighbor[neighbor], 0, &request.back());
+
+            request.push_back(MPI_Request());
+            m_mpi->Irecv(recv_buffer[neighbor], numofWeights, MPI_UNSIGNED_CHAR, indexNeighbor[neighbor], 0, &request.back());
+            
+            request.push_back(MPI_Request());
+            m_mpi->Irecv(recv_buffer2[neighbor], 2, MPIWrapper::GetDataType(weight_current->Data()), indexNeighbor[neighbor], 0, &request.back());
+
+            }
+            
+            if (m_mpi != nullptr)
+            {
+                m_mpi->WaitAll(request);
+            }
+
+
+            for(int i = 0; i < indexNeighbor.size(); i++){ //for each y
+
+                ElemType unit_recv;
+                unit_recv = (recv_buffer2[i][0] - recv_buffer2[i][1]) / 255.0; 
+
+                for(int j = 0; j < numofWeights; j++){ //un-compress z to x1
+
+                    ElemType uncompress_recv;
+                    uncompress_recv = recv_buffer2[i][1] + recv_buffer[i][j] * unit_recv;
+                    weight_current->GetValue(0, j);
+                    weight_current->SetValue(0, j, uncompress_recv);
+
+                }
+
+                Matrix<ElemType>::ScaleAndAdd(1, *weight_current, *WeightReplica[i]);
+
+            }
+
+
+            delete[] send_buffer;
+            delete[] send_buffer2;
+
+            for(int i = 0; i <indexNeighbor.size(); i++){
+                delete[] recv_buffer[i];
+            }
+            delete[] recv_buffer;
+
+            for(int i = 0; i <indexNeighbor.size(); i++){
+                delete[] recv_buffer2[i];
+            }
+            delete[] recv_buffer2;
+        }
+
         }
 
 
@@ -1563,6 +2004,15 @@ size_t SGD<ElemType>::TrainOneEpoch(ComputationNetworkPtr net,
             {
                 noMoreSamplesToProcess = !wasDataRead;
             }
+
+
+
+
+
+
+
+
+
         }
 
         // using parameter server for parameter update
@@ -1758,6 +2208,7 @@ size_t SGD<ElemType>::TrainOneEpoch(ComputationNetworkPtr net,
         ProfilerTimeEnd(profPost, profilerEvtMainPost);
         ProfilerTimeEnd(profMinibatch, profilerEvtMainMinibatch);
     }
+    //printf("%d\n", i);
 
     // --- END MAIN MINIBATCH LOOP
 
@@ -1823,6 +2274,8 @@ size_t SGD<ElemType>::TrainOneEpoch(ComputationNetworkPtr net,
             net, evaluationNodesWhichAccumulateResult, m_gradHeader, m_mpi, epochEvalErrors, evaluationNodes,
             localEpochEvalErrors, ContainsAccumulatedResult, m_packThresholdSizeInBytes);
     }
+
+    //printf("[%d] numMBsRun:%d\n", myrank, (int)numMBsRun);
 
     return numMBsRun;
 }
@@ -2325,7 +2778,10 @@ void SGD<ElemType>::TrainOneMiniEpochAndReloadModel(ComputationNetworkPtr net,
                                                     std::string prefixMsg,
                                                     const size_t maxNumOfSamples)
 {
-    TrainOneEpoch(net, refNet, refNode, epochNumber, epochSize,
+    //estimated_
+    static std::vector<std::unique_ptr<Matrix<ElemType>>> null_fill;
+
+    TrainOneEpoch(null_fill, net, refNet, refNode, epochNumber, epochSize,
                   trainSetDataReader, learnRatePerSample, minibatchSize, featureNodes,
                   labelNodes, criterionNodes, evaluationNodes,
                   inputMatrices, learnableNodes, smoothedGradients, smoothedCounts,
@@ -3397,7 +3853,7 @@ SGDParams::SGDParams(const ConfigRecordType& configSGD, size_t sizeofElemType)
 #endif
             m_isAsyncBufferEnabled = configDataParallelASGD(L"UsePipeline", false);
             m_isSimulateMA = configDataParallelASGD(L"SimModelAverage", false); // using parameter server-based version of ModelAveragingSGD
-            if (configDataParallelASGD.Exists(L"AdjustLearningRateAtBeginning")) // adjust learning rate per m_adjustNumInBatch minibatches until to original one,
+            if (configDataParallelASGD.Exists(L"AdjustLearningRateAtBeginning")) // adjust learning rate per m_adjustNumInBatch minibatchs until to original one,
                                                                                  // this option could be used to takcle the unstableness of DataParallelASGD if you get a chance
             {
                 const ConfigRecordType & configAdjustLearningRateAtBeginning(configDataParallelASGD(L"AdjustLearningRateAtBeginning", ConfigRecordType::Record()));

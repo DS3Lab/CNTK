@@ -490,7 +490,8 @@ protected:
                                             const std::vector<ComputationNodeBasePtr>& featureNodes,
                                             StreamMinibatchInputs* inputMatrices);
 
-    size_t TrainOneEpoch(ComputationNetworkPtr net,
+    size_t TrainOneEpoch(std::vector<std::unique_ptr<Matrix<ElemType>>>& WeightReplica,
+                         ComputationNetworkPtr net,
                          ComputationNetworkPtr refNet,
                          const ComputationNodeBasePtr& refNode,
                          const int epochNumber,
