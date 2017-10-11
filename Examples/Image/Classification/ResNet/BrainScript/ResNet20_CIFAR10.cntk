@@ -72,6 +72,13 @@ TrainConvNet = {
         momentumPerMB = 0.9
         maxEpochs = 160
         L2RegWeight = 0.0001
+	
+	parallelTrain = {
+            parallelizationMethod = "dataParallelSGD"
+            parallelizationStartEpoch = 1
+            distributedMBReading = true
+            dataParallelSGD = { gradientBits = 32 }
+        }
 
         numMBsToShowResult = 100
     }
