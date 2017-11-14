@@ -120,6 +120,8 @@ public:
         }
         else
         {
+            // if((int) m_mpi->CurrentNodeRank() == 0)
+            //     printf("222222222\n");
             AggregateGradientsImpl(gradients, headerCPU, showSyncPerfStats);
             return (headerCPU->numSamples != 0);
         }
@@ -289,134 +291,291 @@ private:
         }
 
         // Initiate transfer of the bufferred data to the CPU if needed
-        if (ShouldCopyDataToCPU(deviceId))
-        {
-            size_t gpuDataTransfersIdx = 0;
-            Matrix<ElemType>* gpuCopyBuffer = m_aggregationBuffer.get();
-            for (size_t i : m_gradientIndexToAggregate)
-            {
-                if (i != -1)
-                {
-                    gpuCopyBuffer = gradients[i];
-                }
-                else
-                {
-                    // i == -1, first element is for packed gradients, which should not be with AsyncAggregation
-                    assert(m_useAsyncAggregation == false);
-                }
-                m_gpuDataTransferers[gpuDataTransfersIdx]->CopyGPUToCPUAsync(gpuCopyBuffer->Data(), gpuCopyBuffer->GetNumElements(), m_intermediateCPUBuffers[gpuDataTransfersIdx].get());
-                gpuDataTransfersIdx++;
-            }
-        }
+        // if (ShouldCopyDataToCPU(deviceId))
+        // {
+        //     size_t gpuDataTransfersIdx = 0;
+        //     Matrix<ElemType>* gpuCopyBuffer = m_aggregationBuffer.get();
+        //     for (size_t i : m_gradientIndexToAggregate)
+        //     {
+        //         if (i != -1)
+        //         {
+        //             gpuCopyBuffer = gradients[i];
+        //         }
+        //         else
+        //         {
+        //             // i == -1, first element is for packed gradients, which should not be with AsyncAggregation
+        //             assert(m_useAsyncAggregation == false);
+        //         }
+        //         m_gpuDataTransferers[gpuDataTransfersIdx]->CopyGPUToCPUAsync(gpuCopyBuffer->Data(), gpuCopyBuffer->GetNumElements(), m_intermediateCPUBuffers[gpuDataTransfersIdx].get());
+        //         gpuDataTransfersIdx++;
+        //     }
+        // }
 
         // Initiate receive of the header on the main node
-        std::vector<MPI_Request> recvHeaderRequests(NumProc() - 1);
-        if (m_mpi->IsMainNode())
-        {
-            for (size_t j = 0; j < NumProc() - 1; ++j)
-            {
-                int source = (j >= MyRank()) ? (j + 1) : j;
-                // We use a tag of 'numGradMatrices' for the pre-aggregation header
-                m_mpi->Irecv(m_recvHeaders[j], m_recvHeaders[j]->Size(), MPI_CHAR, source, numGradMatrices, &(recvHeaderRequests[j])) || MpiFail("MPI_Irecv");
-            }
-        }
-
-        // Send the headers from all nodes but the main node
-        MPI_Request sendHeaderRequest;
-        if (!m_mpi->IsMainNode())
-            m_mpi->Isend(headerCPU, headerCPU->Size(), MPI_CHAR, m_mpi->MainNodeRank(), numGradMatrices, &sendHeaderRequest) || MpiFail("MPI_Isend");
-
-        // Perform async allreduce on the gradient data
+        // std::vector<MPI_Request> recvHeaderRequests(NumProc() - 1);
+        // if (m_mpi->IsMainNode())
+        // {
+        //     for (size_t j = 0; j < NumProc() - 1; ++j)
+        //     {
+        //         int source = (j >= MyRank()) ? (j + 1) : j;
+        //         // We use a tag of 'numGradMatrices' for the pre-aggregation header
+        //         m_mpi->Irecv(m_recvHeaders[j], m_recvHeaders[j]->Size(), MPI_CHAR, source, numGradMatrices, &(recvHeaderRequests[j])) || MpiFail("MPI_Irecv");
+        //     }
+        // }
         std::vector<MPI_Request> allReduceRequests;
-        if (!m_nccl.IsSupported())
+        size_t gpuToCpuIndex = 0;
+        size_t cpuToGpuIndex = 0;
+        size_t allReduceIndex = 0;
+        size_t numGradientIndex = m_gradientIndexToAggregate.size();
+        if (numGradientIndex > 0)
         {
-            size_t allReduceIndex = 0;
-            ElemType* reductionBuffer;
-            for (size_t i : m_gradientIndexToAggregate)
-            {
-                allReduceRequests.push_back(MPI_Request());
-                reductionBuffer = (i == -1)? m_aggregationBuffer->Data() : gradients[i]->Data();
-                if (m_mpi->UseGpuGdr() == 0 && deviceId != CPUDEVICE)
-                {
-                    m_gpuDataTransferers[allReduceIndex]->WaitForCopyGPUToCPUAsync();
-                    reductionBuffer = m_intermediateCPUBuffers[allReduceIndex].get();
-                }
+            // non-GDR && GPU
 
-                if (m_mpi->UseGpuGdr() == 0)
+            if ((m_mpi->UseGpuGdr() == 0) && (deviceId != CPUDEVICE))
+            {
+                // printf("11111111\n");
+
+                Matrix<ElemType>* gpuCopyBuffer = m_aggregationBuffer.get();
+
+                ElemType* reductionBuffer;
+                // currentGradientIndex will load the index from m_gradientIndexToAggregate
+                size_t currentGradientIndex = m_gradientIndexToAggregate[0];
+                size_t nextGradientIndex = 0; // 0 is for initialization only
+                // Get the first Gradient, and do async D-to-H copy
+                if (currentGradientIndex != -1)
                 {
-                    m_mpi->Iallreduce(MPI_IN_PLACE, reductionBuffer, (i == -1) ? m_aggregationBuffer->GetNumElements() : gradients[i]->GetNumElements(),
-                        MPIWrapper::GetDataType(reductionBuffer), MPI_SUM, &allReduceRequests.back()) || MpiFail("MPI_Iallreduce");
-                    allReduceIndex++;
+                    gpuCopyBuffer = gradients[currentGradientIndex];
                 }
-                // TODO: Remove this when MPI_Iallreduce with CUDA - aware is supported
                 else
                 {
-                    m_mpi->AllReduce(reductionBuffer, (i == -1) ? m_aggregationBuffer->GetNumElements() : gradients[i]->GetNumElements());
+                    // currentGradientIndex == -1, first element is for packed gradients, which should not be with AsyncAggregation
+                    assert(m_useAsyncAggregation == false);
+                }
+                // First sync_g_to_c_copy
+                // TODO: we need a CopyGPUToCPUSync
+                #ifndef CPUONLY
+                cudaMemcpy(m_intermediateCPUBuffers[gpuToCpuIndex].get(), gpuCopyBuffer->Data(), gpuCopyBuffer->GetNumElements() * sizeof(ElemType), cudaMemcpyDeviceToHost);
+                #endif
+                gpuToCpuIndex++;
+
+                for (size_t i = 1; i <= numGradientIndex; i ++)
+                {
+                    // Get next gradient
+                    if (i < numGradientIndex)
+                    {
+                        nextGradientIndex = m_gradientIndexToAggregate[i];
+                        if (nextGradientIndex != -1)
+                        {
+                            gpuCopyBuffer = gradients[nextGradientIndex];
+                        }
+                        else
+                        {
+                            // currentGradientIndex == -1, first element is for packed gradients, which should not be with AsyncAggregation
+                            assert(m_useAsyncAggregation == false);
+                        }
+                        // Async D-to-H copy (next gradient)
+                        m_gpuDataTransferers[gpuToCpuIndex]->CopyGPUToCPUAsync(gpuCopyBuffer->Data(), gpuCopyBuffer->GetNumElements(), m_intermediateCPUBuffers[gpuToCpuIndex].get());
+                    }
+                    // Wait for previous copy
+                    m_gpuDataTransferers[allReduceIndex]->WaitForCopyGPUToCPUAsync();
+                    
+                    // Allreduce
+                    reductionBuffer = m_intermediateCPUBuffers[allReduceIndex].get();
+                    m_mpi->AllReduce(reductionBuffer, (currentGradientIndex == -1) ? m_aggregationBuffer->GetNumElements() : gradients[currentGradientIndex]->GetNumElements());
+
+                    // Create async H-to-G copy
+                    cpuToGpuIndex = allReduceIndex;
+                    m_gpuDataTransferers[cpuToGpuIndex]->CopyCPUToGPUAsync(m_intermediateCPUBuffers[cpuToGpuIndex].get(),
+                        (currentGradientIndex == -1) ? m_aggregationBuffer->GetNumElements() : gradients[currentGradientIndex]->GetNumElements(),
+                        (currentGradientIndex == -1) ? m_aggregationBuffer->Data() : gradients[currentGradientIndex]->Data());
+                    allReduceIndex = gpuToCpuIndex;
+                    gpuToCpuIndex ++;
+                    currentGradientIndex = nextGradientIndex;
                 }
             }
-        } 
-        else
-        {
-            std::vector<Matrix<ElemType>*> ncclReduceGradients;
-            for (size_t i : m_gradientIndexToAggregate)
+            // non-NCCL 
+            else if (!m_nccl.IsSupported())
             {
-                ncclReduceGradients.push_back((i == -1) ? m_aggregationBuffer.get() : gradients[i]);
+                // printf("222222\n");
+                ElemType* reductionBuffer;
+                for (size_t i : m_gradientIndexToAggregate)
+                {
+                    allReduceRequests.push_back(MPI_Request());
+                    reductionBuffer = (i == -1)? m_aggregationBuffer->Data() : gradients[i]->Data();
+                    // CPU
+                    if (m_mpi->UseGpuGdr() == 0)
+                    {
+                        // printf("33333\n");
+                        m_mpi->Iallreduce(MPI_IN_PLACE, reductionBuffer, (i == -1) ? m_aggregationBuffer->GetNumElements() : gradients[i]->GetNumElements(),
+                            MPIWrapper::GetDataType(reductionBuffer), MPI_SUM, &allReduceRequests.back()) || MpiFail("MPI_Iallreduce");
+                        allReduceIndex++;
+                    }
+                    // GDR && GPU
+                    else if (deviceId != CPUDEVICE)
+                    {
+                        // printf("4444444\n");
+                        m_mpi->AllReduce(reductionBuffer, (i == -1) ? m_aggregationBuffer->GetNumElements() : gradients[i]->GetNumElements());
+                    }
+                }
+            } 
+            else if (m_nccl.IsSupported())
+            {
+                // printf("55555\n");
+                std::vector<Matrix<ElemType>*> ncclReduceGradients;
+                for (size_t i : m_gradientIndexToAggregate)
+                {
+                    ncclReduceGradients.push_back((i == -1) ? m_aggregationBuffer.get() : gradients[i]);
+                }
+                m_nccl.AllReduce(ncclReduceGradients);
             }
-            m_nccl.AllReduce(ncclReduceGradients);
         }
+
+
+
+        // Send the headers from all nodes but the main node
+        // MPI_Request sendHeaderRequest;
+        // if (!m_mpi->IsMainNode())
+        //     m_mpi->Isend(headerCPU, headerCPU->Size(), MPI_CHAR, m_mpi->MainNodeRank(), numGradMatrices, &sendHeaderRequest) || MpiFail("MPI_Isend");
+
+        // Perform async allreduce on the gradient data
+        // std::vector<MPI_Request> allReduceRequests;
+        // if (!m_nccl.IsSupported())
+        // {
+        //     size_t allReduceIndex = 0;
+        //     ElemType* reductionBuffer;
+
+        //     // if((int) m_mpi->CurrentNodeRank() == 0)
+        //     //     printf("333333333\n");
+
+        //     for (size_t i : m_gradientIndexToAggregate)
+        //     {
+        //         allReduceRequests.push_back(MPI_Request());
+        //         reductionBuffer = (i == -1)? m_aggregationBuffer->Data() : gradients[i]->Data();
+        //         if (m_mpi->UseGpuGdr() == 0 && deviceId != CPUDEVICE)
+        //         {
+        //             m_gpuDataTransferers[allReduceIndex]->WaitForCopyGPUToCPUAsync();
+        //             reductionBuffer = m_intermediateCPUBuffers[allReduceIndex].get();
+        //         }
+
+        //         if (m_mpi->UseGpuGdr() == 0)
+        //         {
+        //             // printf("2222222222\n");
+        //             m_mpi->Iallreduce(MPI_IN_PLACE, reductionBuffer, (i == -1) ? m_aggregationBuffer->GetNumElements() : gradients[i]->GetNumElements(),
+        //                 MPIWrapper::GetDataType(reductionBuffer), MPI_SUM, &allReduceRequests.back()) || MpiFail("MPI_Iallreduce");
+        //             allReduceIndex++;
+        //         }
+        //         // TODO: Remove this when MPI_Iallreduce with CUDA - aware is supported
+        //         else
+        //         {
+        //             // printf("333333333\n");
+        //             m_mpi->AllReduce(reductionBuffer, (i == -1) ? m_aggregationBuffer->GetNumElements() : gradients[i]->GetNumElements());
+        //         }
+        //     }
+        // } 
+        // else
+        // {
+
+        //     std::vector<Matrix<ElemType>*> ncclReduceGradients;
+        //     for (size_t i : m_gradientIndexToAggregate)
+        //     {
+        //         ncclReduceGradients.push_back((i == -1) ? m_aggregationBuffer.get() : gradients[i]);
+        //     }
+        //     m_nccl.AllReduce(ncclReduceGradients);
+
+        // }
 
         // On the main node wait for the headers to arrive and aggregate
-        if (m_mpi->IsMainNode())
-        {
-            size_t numNodesHeadersReceivedFrom = 0;
-            while (numNodesHeadersReceivedFrom < (NumProc() - 1))
-            {
-                int idx = MPI_UNDEFINED;
-                m_mpi->Waitany(recvHeaderRequests.size(), recvHeaderRequests.data(), &idx, MPI_STATUS_IGNORE) || MpiFail("MPI_Waitany");
-                if (idx == MPI_UNDEFINED)
-                {
-                    break;
-                }
+        // if (m_mpi->IsMainNode())
+        // {
+        //     // long AggregateHeader_start = Clock::GetTimeStamp();
 
-                numNodesHeadersReceivedFrom++;
+        //     size_t numNodesHeadersReceivedFrom = 0;
+        //     while (numNodesHeadersReceivedFrom < (NumProc() - 1))
+        //     {
+        //         int idx = MPI_UNDEFINED;
+        //         m_mpi->Waitany(recvHeaderRequests.size(), recvHeaderRequests.data(), &idx, MPI_STATUS_IGNORE) || MpiFail("MPI_Waitany");
+        //         if (idx == MPI_UNDEFINED)
+        //         {
+        //             break;
+        //         }
 
-                headerCPU->Aggregate(m_recvHeaders[idx], true);
-            }
+        //         numNodesHeadersReceivedFrom++;
 
-            assert(numNodesHeadersReceivedFrom == (NumProc() - 1));
-        }
+        //         headerCPU->Aggregate(m_recvHeaders[idx], true);
+        //     }
+        //     assert(numNodesHeadersReceivedFrom == (NumProc() - 1));
 
+        // }
+
+        // long BroadcastHeader_start = Clock::GetTimeStamp();
         // Broadcast the aggregated header to all nodes
-        m_mpi->Bcast(headerCPU, headerCPU->Size(), MPI_CHAR, m_mpi->MainNodeRank());
+
+        // m_mpi->Bcast(headerCPU, headerCPU->Size(), MPI_CHAR, m_mpi->MainNodeRank());
 
         if (m_nccl.IsSupported())
         {
+            // printf("666666\n");
             m_nccl.Sync();
         }
-        // TODO: Remove this when MPI_Iallreduce with CUDA-aware is supported 
+        // Non-GDR && GPU
+        else if ((m_mpi->UseGpuGdr() == 0) && (deviceId != CPUDEVICE))
+        {
+            // printf("77777\n");
+            // Wait for async CPU-to-GPU copy (non-GDR)
+            for (size_t i = 0; i < allReduceIndex; i++)
+                m_gpuDataTransferers[i]->WaitForCopyCPUToGPUAsync();
+        }
+        // CPU
         else if (m_mpi->UseGpuGdr() == 0)
         {
-            // Wait for the allreduce operations to finish and initiate transfer back to the GPU if needed
-            size_t gpuDataTransfersIdx = 0; // Index of allReduceRequest for each un-packed gradient
-            for (size_t i : m_gradientIndexToAggregate)
+            // printf("88888\n");
+            // Wait for the Iallreduce operations to finish
+            for (size_t i = 0; i < allReduceIndex; i++)
             {
-                m_mpi->Wait(&allReduceRequests[gpuDataTransfersIdx], MPI_STATUSES_IGNORE) || MpiFail("MPI_Wait");
-                if (deviceId != CPUDEVICE)
-                {
-                    m_gpuDataTransferers[gpuDataTransfersIdx]->CopyCPUToGPUAsync(m_intermediateCPUBuffers[gpuDataTransfersIdx].get(),
-                        (i == -1) ? m_aggregationBuffer->GetNumElements() : gradients[i]->GetNumElements(),
-                        (i == -1) ? m_aggregationBuffer->Data() : gradients[i]->Data());
-                }
-                gpuDataTransfersIdx++;
-            }
-
-            // Wait for copy data from CPU to GPU, if not running on CPU and not NCCL enabled
-            if (deviceId != CPUDEVICE)
-            {
-                for (size_t i = 0; i < m_gradientIndexToAggregate.size(); i++)
-                    m_gpuDataTransferers[i]->WaitForCopyCPUToGPUAsync();
+                m_mpi->Wait(&allReduceRequests[i], MPI_STATUSES_IGNORE) || MpiFail("MPI_Wait");
             }
         }
+
+        // if (m_nccl.IsSupported())
+        // {
+        //     // printf("444444444\n");
+        //     m_nccl.Sync();
+        // }
+        // // TODO: Remove this when MPI_Iallreduce with CUDA-aware is supported 
+        // else if (m_mpi->UseGpuGdr() == 0)
+        // {
+        //     // long Allreduce_start = Clock::GetTimeStamp();
+
+        //     // printf("5555555555555\n");
+        //     // Wait for the allreduce operations to finish and initiate transfer back to the GPU if needed
+        //     size_t gpuDataTransfersIdx = 0; // Index of allReduceRequest for each un-packed gradient
+
+        //     // if((int) m_mpi->CurrentNodeRank() == 0)
+        //     //     printf("44444444444\n");
+
+        //     for (size_t i : m_gradientIndexToAggregate)
+        //     {
+        //         m_mpi->Wait(&allReduceRequests[gpuDataTransfersIdx], MPI_STATUSES_IGNORE) || MpiFail("MPI_Wait");
+        //         if (deviceId != CPUDEVICE)
+        //         {
+        //             m_gpuDataTransferers[gpuDataTransfersIdx]->CopyCPUToGPUAsync(m_intermediateCPUBuffers[gpuDataTransfersIdx].get(),
+        //                 (i == -1) ? m_aggregationBuffer->GetNumElements() : gradients[i]->GetNumElements(),
+        //                 (i == -1) ? m_aggregationBuffer->Data() : gradients[i]->Data());
+        //         }
+        //         gpuDataTransfersIdx++;
+        //     }
+
+        //     // Wait for copy data from CPU to GPU, if not running on CPU and not NCCL enabled
+        //     if (deviceId != CPUDEVICE)
+        //     {
+        //         // if((int) m_mpi->CurrentNodeRank() == 0)
+        //         //     printf("5555555555\n");
+                
+        //         for (size_t i = 0; i < m_gradientIndexToAggregate.size(); i++)
+        //             m_gpuDataTransferers[i]->WaitForCopyCPUToGPUAsync();
+        //     }
+
+        // }
 
         // Copy data back to the packed gradients from the continous buffer
         offset = 0;
@@ -427,8 +586,11 @@ private:
         }
 
         // Wait for completion of the async send requests
-        if (!m_mpi->IsMainNode())
-            m_mpi->Wait(&sendHeaderRequest, MPI_STATUSES_IGNORE) || MpiFail("MPI_Wait");
+        // if (!m_mpi->IsMainNode())
+        // {
+        //     m_mpi->Wait(&sendHeaderRequest, MPI_STATUSES_IGNORE) || MpiFail("MPI_Wait");
+
+        // }
 
         if (showSyncPerfStats)
         {
