@@ -11,7 +11,7 @@
 
 #include "GPUMatrix.h"
 #include "GPUMatrixCUDAKernels.cuh"
-//#include "GPUSparseMatrix.h"
+#include "GPUSparseMatrix.h"
 #include "GPUTensor.h"
 #include "CommonMatrix.h"
 #define TENSOR_OPS_DECL __device__ __host__
@@ -19,8 +19,8 @@
 #include "device_launch_parameters.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <curand.h>
-#include <curand_kernel.h>
+// #include <curand.h>
+// #include <curand_kernel.h>
 #include "cublas_v2.h"
 #include <assert.h>
 #include <memory>
@@ -430,6 +430,65 @@ void GPUMatrix<ElemType>::ChangeDeviceTo(DEVICEID_TYPE to_id)
     PrepareDevice((DEVICEID_TYPE) to_id);
     SetComputeDeviceId(to_id);
 }
+
+
+//seven
+
+template <class ElemType>
+void GPUMatrix<ElemType>::GPUScaleAndAdd(int n, float scale1, ElemType *x, float scale2, ElemType *y)
+{
+    int blocksPerGrid = (int) ceil(1.0 * n / GridDim::maxThreadsPerBlock);
+    return _GPUscaleAndAdd<<<blocksPerGrid, GridDim::maxThreadsPerBlock, 0, t_stream>>>(n, scale1, x, scale2, y);
+    
+}
+
+template <class ElemType>
+void GPUMatrix<ElemType>::GPUCopyValue(ElemType* x, ElemType* y, int n)
+{
+    int blocksPerGrid = (int) ceil(1.0 * n / GridDim::maxThreadsPerBlock);
+    return _copyValue<<<blocksPerGrid, GridDim::maxThreadsPerBlock, 0, t_stream>>>(x, y, n);
+    
+} 
+
+template <class ElemType>
+void GPUMatrix<ElemType>::GPUFindMaxAndMin(ElemType *array, ElemType *max, ElemType *min, int *mutex, int n)
+{
+    int blocksPerGrid = (int) ceil(1.0 * n / GridDim::maxThreadsPerBlock);
+    return _findMaxAndMin<<<blocksPerGrid, GridDim::maxThreadsPerBlock, 0, t_stream>>>(array, max, min, mutex, n);
+    
+}
+
+template <class ElemType>
+void GPUMatrix<ElemType>::GPUQuantizeValue(unsigned char *x, ElemType *y, ElemType *maxandmin, int n, curandState* states)
+{
+    int blocksPerGrid = (int) ceil(1.0 * n / GridDim::maxThreadsPerBlock);
+    return _quantizeValue<<<blocksPerGrid, GridDim::maxThreadsPerBlock, 0, t_stream>>>(x, y, maxandmin, n, states);
+    
+}
+
+template <class ElemType>
+void GPUMatrix<ElemType>::GPUDequantizeValue(unsigned char *recv, ElemType *maxandmin, ElemType *x, int n)
+{
+    int blocksPerGrid = (int) ceil(1.0 * n / GridDim::maxThreadsPerBlock);
+    return _dequantizeValue<<<blocksPerGrid, GridDim::maxThreadsPerBlock, 0, t_stream>>>(recv, maxandmin, x, n);
+    
+}
+
+
+template <class ElemType>
+curandState* GPUMatrix<ElemType>::GPUInit_curand(int n, unsigned int seed)
+{
+    curandState* states;
+
+    int blocksPerGrid = (int) ceil(1.0 * n / GridDim::maxThreadsPerBlock);
+    cudaMalloc(&states, blocksPerGrid * GridDim::maxThreadsPerBlock * sizeof(curandState));
+
+    _initCURand<ElemType><<<blocksPerGrid, GridDim::maxThreadsPerBlock, 0, t_stream>>>(seed, states);
+
+    return states;    
+}
+
+
 
 template <class ElemType>
 void GPUMatrix<ElemType>::performElementWiseFunction(ElementWiseOperator kind, const ElemType* src)
@@ -3340,9 +3399,9 @@ void GPUMatrix<ElemType>::MaxPoolingBackward(const GPUMatrix<ElemType>& out, con
 }
 
 template <class ElemType>
-void GPUMatrix<ElemType>::MaxROIPoolingForward(const size_t numRois, const size_t numImg, const size_t channels, const size_t width, const size_t height,
-                                               const size_t pooledWidth, const size_t pooledHeight, const GPUMatrix<ElemType>& roiData, GPUMatrix<ElemType>& output, 
-                                               GPUMatrix<ElemType>& argmax, double spatialScale) const
+void GPUMatrix<ElemType>::ROIPoolingForward(const size_t numRois, const size_t numImg, const size_t channels, const size_t width, const size_t height,
+                                            const size_t pooledWidth, const size_t pooledHeight, const GPUMatrix<ElemType>& roiData, GPUMatrix<ElemType>& output, 
+                                            GPUMatrix<ElemType>& argmax) const
 {
     PrepareDevice();
     SyncGuard syncGuard;
@@ -3350,14 +3409,14 @@ void GPUMatrix<ElemType>::MaxROIPoolingForward(const size_t numRois, const size_
     int count = numRois * numImg * channels * pooledHeight * pooledWidth;
     const int blockSize = GridDim::maxThreadsPerBlock;
     auto numThreads = dim3((int)floor((double)(count + blockSize - 1) / blockSize));
-    kMaxROIPoolingForward<<<numThreads, blockSize, 0, t_stream>>>(count, numRois, numImg, channels, width, height, 
-                                                                  pooledWidth, pooledHeight, Data(), roiData.Data(), output.Data(), argmax.Data(), spatialScale);
+    kROIPoolingForward<<<numThreads, blockSize, 0, t_stream>>>(count, numRois, numImg, channels, width, height, 
+                                                               pooledWidth, pooledHeight, Data(), roiData.Data(), output.Data(), argmax.Data());
 }
 
 template <class ElemType>
-void GPUMatrix<ElemType>::MaxROIPoolingBackward(const size_t numRois, const size_t numImg, const size_t channels, const size_t width, const size_t height,
-                                                const size_t pooledWidth, const size_t pooledHeight, const GPUMatrix<ElemType>& roiData, GPUMatrix<ElemType>& grad, 
-                                                GPUMatrix<ElemType>& argmax, double spatialScale) const
+void GPUMatrix<ElemType>::ROIPoolingBackward(const size_t numRois, const size_t numImg, const size_t channels, const size_t width, const size_t height,
+                                             const size_t pooledWidth, const size_t pooledHeight, const GPUMatrix<ElemType>& roiData, GPUMatrix<ElemType>& grad, 
+                                             GPUMatrix<ElemType>& argmax) const
 {
     PrepareDevice();
     SyncGuard syncGuard;
@@ -3365,8 +3424,8 @@ void GPUMatrix<ElemType>::MaxROIPoolingBackward(const size_t numRois, const size
     int count = numImg * channels * height * width;
     const int blockSize = GridDim::maxThreadsPerBlock;
     auto numThreads = dim3((int)floor((double)(count + blockSize - 1) / blockSize));
-    kMaxROIPoolingBackward<<<numThreads, blockSize, 0, t_stream>>>(count, numRois, numImg, channels, width, height, 
-                                                                   pooledWidth, pooledHeight, Data(), roiData.Data(), grad.Data(), argmax.Data(), spatialScale);
+    kROIPoolingBackward<<<numThreads, blockSize, 0, t_stream>>>(count, numRois, numImg, channels, width, height, 
+                                                                pooledWidth, pooledHeight, Data(), roiData.Data(), grad.Data(), argmax.Data());
 }
 
 template <class ElemType>
