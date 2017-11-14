@@ -19,6 +19,8 @@
 #include <iostream> // for cout/cerr
 #include <memory>   // for unique_ptr
 #include <limits.h> // for ULONG_MAX
+#include <curand_kernel.h>
+#include <curand.h>
 
 //#include "CPUMatrix.h"
 //#include "CPUSparseMatrix.h"
@@ -259,6 +261,7 @@ public:
     const ElemType& operator()(const size_t /*row*/, const size_t /*col*/) const { LogicError("GPUMatrix doesn't support operator(,) on the CPU."); }
     ElemType Get00Element() const;
 
+
     void SetValue(const ElemType v);
     void SetValue(const ElemType* d_v); // d_v is pointer to the the value in GPU memory
     void SetColumn(const ElemType* colPointer, size_t colInd);
@@ -497,13 +500,13 @@ public:
                             GPUMatrix<ElemType>& grad) const;
     void MaxUnpooling(const GPUMatrix<int>& mpRowCol, const GPUMatrix<int>& mpRowIndices, const GPUMatrix<int>& indices, const GPUMatrix<ElemType>& poolInput, GPUMatrix<ElemType>& input) const;
 
-    void MaxROIPoolingForward(const size_t numRois, const size_t numImg, const size_t channels, const size_t width, const size_t height,
-                              const size_t pooledWidth, const size_t pooledHeight, const GPUMatrix<ElemType>& roiData, GPUMatrix<ElemType>& output, 
-                              GPUMatrix<ElemType>& argmax, double spatialScale) const;
+    void ROIPoolingForward(const size_t numRois, const size_t numImg, const size_t channels, const size_t width, const size_t height,
+                           const size_t pooledWidth, const size_t pooledHeight, const GPUMatrix<ElemType>& roiData, GPUMatrix<ElemType>& output, 
+                           GPUMatrix<ElemType>& argmax) const;
 
-    void MaxROIPoolingBackward(const size_t numRois, const size_t numImg, const size_t channels, const size_t width, const size_t height,
-                               const size_t pooledWidth, const size_t pooledHeight, const GPUMatrix<ElemType>& roiData, GPUMatrix<ElemType>& grad, 
-                               GPUMatrix<ElemType>& argmax, double spatialScale) const;
+    void ROIPoolingBackward(const size_t numRois, const size_t numImg, const size_t channels, const size_t width, const size_t height,
+                            const size_t pooledWidth, const size_t pooledHeight, const GPUMatrix<ElemType>& roiData, GPUMatrix<ElemType>& grad, 
+                            GPUMatrix<ElemType>& argmax) const;
 
     void AveragePoolingForward(const GPUMatrix<int>& mpRowCol, const GPUMatrix<int>& mpRowIndices, const GPUMatrix<int>& indices, GPUMatrix<ElemType>& output) const;
     void AveragePoolingBackward(const GPUMatrix<int>& mpRowCol, const GPUMatrix<int>& mpRowIndices, const GPUMatrix<int>& indices, GPUMatrix<ElemType>& grad) const;
@@ -529,6 +532,14 @@ public:
     static void Multiply1x1AndWeightedAdd(ElemType alpha, const GPUMatrix<ElemType>& a, const GPUMatrix<ElemType>& b, ElemType beta, GPUMatrix<ElemType>& c);
 
     static void ColumnwiseScaleAndWeightedAdd(ElemType alpha, const GPUMatrix<ElemType>& a, const GPUMatrix<ElemType>& v, ElemType beta, GPUMatrix<ElemType>& c);
+
+    //seven
+    static void GPUCopyValue(ElemType* x, ElemType* y, int n);
+    static void GPUScaleAndAdd(int n, float scale1, ElemType *x, float scale2, ElemType *y);
+    static void GPUFindMaxAndMin(ElemType *array, ElemType *max, ElemType *min, int *mutex, int n);
+    static void GPUQuantizeValue(unsigned char *x, ElemType *y, ElemType *maxandmin, int n, curandState* states);
+    static void GPUDequantizeValue(unsigned char *recv, ElemType *maxandmin, ElemType *x, int n);
+    static curandState* GPUInit_curand(int n, unsigned int seed);
 
     static void ScaleAndAdd(ElemType alpha, const GPUMatrix<ElemType>& a, GPUMatrix<ElemType>& c);
     static void ScaleAndAdd(ElemType alpha, const GPUMatrix<ElemType>& a, const GPUMatrix<ElemType>& b, GPUMatrix<ElemType>& c);
