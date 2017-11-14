@@ -18,6 +18,8 @@
 #include <cuda_runtime.h>
 #include <assert.h>
 #include <float.h>
+#include <curand_kernel.h>
+#include <curand.h>
 #pragma pop_macro("TENSOR_OPS_DECL")
 
 // REVIEW alexeyk: disable warnings properly for GCC/clang
@@ -201,6 +203,147 @@ private:
 // The first parameters of every function are inputs, and the last two arguments to each function are always
 // (ElemenType *res, CUDA_LONG N), a pointer and length of the output block. Each thread computes a function
 // of the inputs for one value in the output.
+
+//seven
+
+// template <class ElemType>
+
+
+
+
+
+template <class ElemType>
+__global__ void _GPUscaleAndAdd(int n, float scale1, ElemType *x, float scale2, ElemType *y)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = index; i < n; i += stride)
+        y[i] = scale1 * x[i] + scale2 * y[i];              
+
+}
+
+template <class ElemType>
+__global__ void _copyValue(ElemType* x, const ElemType* y, const int n)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = index; i < n; i += stride)
+        x[i] = y[i];
+}
+
+template <class ElemType>
+__global__ void _findMaxAndMin(ElemType *array, ElemType *max, ElemType *min, int *mutex, int n)
+{
+    unsigned int index = threadIdx.x + blockIdx.x * blockDim.x;
+    unsigned int stride = gridDim.x * blockDim.x;
+    unsigned int offset = 0;
+
+    __shared__ ElemType cache1[GridDim::maxThreadsPerBlock];
+    __shared__ ElemType cache2[GridDim::maxThreadsPerBlock];
+
+
+    ElemType temp1 = 0;
+    ElemType temp2 = 0;
+    while(index + offset < n){
+
+        temp1 = fmaxf(temp1, array[index + offset]);
+        temp2 = fminf(temp2, array[index + offset]);
+
+        offset += stride;
+    }
+
+    cache1[threadIdx.x] = temp1;
+    cache2[threadIdx.x] = temp2;
+
+    __syncthreads();
+
+
+    // reduction
+    unsigned int i = blockDim.x/2;
+    while(i != 0){
+        if(threadIdx.x < i){
+
+            cache1[threadIdx.x] = fmaxf(cache1[threadIdx.x], cache1[threadIdx.x + i]);
+            cache2[threadIdx.x] = fminf(cache2[threadIdx.x], cache2[threadIdx.x + i]);
+        }
+
+        __syncthreads();
+        i /= 2;
+    }
+
+    if(threadIdx.x == 0){
+        while(atomicCAS(mutex,0,1) != 0);  //lock
+        *max = fmaxf(*max, cache1[0]);
+        *min = fminf(*min, cache2[0]);
+        atomicExch(mutex, 0);  //unlock
+    }
+}
+
+template <class ElemType>
+__global__ void _initCURand(unsigned int seed, curandState* states)
+{
+  unsigned int index = threadIdx.x + blockIdx.x * blockDim.x;
+  /* we have to initialize the state */
+  curand_init(seed, /* the seed can be the same for each core, here we pass the time in from the CPU */
+              index, /* the sequence number should be different for each core (unless you want all
+                             cores to get the same sequence of numbers for some reason - use thread id! */
+              0, /* the offset is how much extra we advance in the sequence for each call, can be 0 */
+              &states[index]);
+}
+
+
+template <class ElemType>
+__global__ void _quantizeValue(unsigned char *x, const ElemType *y, const ElemType *maxandmin, const int n, curandState* states)
+{
+    unsigned int index = threadIdx.x + blockIdx.x * blockDim.x;
+    unsigned int stride = gridDim.x * blockDim.x;
+
+    curandState local_state;
+    local_state = states[index];
+
+    // curand_init(seed, 
+    //             index, 
+    //             0,
+    //             &state);
+
+    ElemType unit = (maxandmin[0] - maxandmin[1]) / 255.0;
+
+    for (int i = index; i < n; i += stride)
+    {
+        ElemType d = (y[i] - maxandmin[1]) / unit; 
+        ElemType prob = d - int(d);
+        unsigned char c;
+
+        if (curand(&local_state)%1000001 / 1000000.0 < prob)
+            c = (unsigned char)(int(d) + 1);
+        else
+            c = (unsigned char)(int(d));
+
+        x[i] = c;
+    }
+    states[index] = local_state;       
+}
+
+
+
+
+template <class ElemType>
+__global__ void _dequantizeValue(unsigned char *recv, ElemType *maxandmin, ElemType *x, const int n)
+{
+    unsigned int index = threadIdx.x + blockIdx.x * blockDim.x;
+    unsigned int stride = gridDim.x * blockDim.x;
+
+    ElemType unit = (maxandmin[0] - maxandmin[1]) / 255.0; 
+
+
+    for (int i = index; i < n; i += stride)
+    {
+        x[i] = maxandmin[1] + recv[i] * unit;
+        
+    }
+          
+}
+
 
 template <class ElemType>
 __global__ void _elementWisePowerOnCuda(
