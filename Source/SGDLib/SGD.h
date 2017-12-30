@@ -313,6 +313,17 @@ protected:
     double m_adjustCoefficient;
     size_t m_adjustPerMinibatches;
 
+    //DecentralizedTrain
+    int m_ifDecentralized;
+    int m_numWarmup;
+    int m_numFisrtCentralizedEpoch;
+    int m_decentralizationMethod;
+    int m_precision;
+    int m_constantLRperMB;
+    double m_decen1;
+    double m_decen2;
+    double m_decen3;
+
     // sequence training
     double m_hSmoothingWeight;
     double m_frameDropThresh;
@@ -490,8 +501,11 @@ protected:
                                             const std::vector<ComputationNodeBasePtr>& featureNodes,
                                             StreamMinibatchInputs* inputMatrices);
 
-    size_t TrainOneEpoch(std::vector<std::unique_ptr<Matrix<ElemType>>>& WeightReplica,
-                         ComputationNetworkPtr net,
+    // static std::vector<std::unique_ptr<Matrix<ElemType>>> null_fill;
+
+    size_t TrainOneEpoch(
+                         std::vector<ElemType*>& WeightReplica,
+			             ComputationNetworkPtr net,
                          ComputationNetworkPtr refNet,
                          const ComputationNodeBasePtr& refNode,
                          const int epochNumber,
@@ -511,7 +525,8 @@ protected:
                          const std::string& prefixMsg = "",
                          const size_t maxNumberOfSamples = SIZE_MAX,
                          const size_t totalMBsSeenBefore = 0,
-                         ::CNTK::Internal::TensorBoardFileWriterPtr tensorBoardWriter = nullptr);
+                         ::CNTK::Internal::TensorBoardFileWriterPtr tensorBoardWriter = nullptr
+                         );
 
     void InitDistGradAgg(int numEvalNodes, int numGradientBits, int deviceId, int traceLevel);
     void InitModelAggregationHandler(int traceLevel, DEVICEID_TYPE devID);
